@@ -1,74 +1,55 @@
 const express = require('express');
 const bcrypt = require('bcryptjs');
 const db = require('../database/db');
-const midtransClient = require('midtrans-client'); // Tambahkan ini jika belum ada
+const midtransClient = require('midtrans-client');
+const { isAuthenticated } = require('../middlewares/middleware'); // Mengimpor middleware
 const router = express.Router();
-const axios = require('axios');
 
 // Inisialisasi Midtrans Snap
 const snap = new midtransClient.Snap({
-    clientKey: process.env.MIDTRANS_CLIENT_KEY, // Kunci klien
-    serverKey: process.env.MIDTRANS_SERVER_KEY, // Kunci server
-    isProduction: false, // Ganti ke true jika dalam mode produksi
+    clientKey: process.env.MIDTRANS_CLIENT_KEY,
+    serverKey: process.env.MIDTRANS_SERVER_KEY,
+    isProduction: false,
 });
 
-
-// Middleware untuk memastikan pengguna sudah terautentikasi
-function isAuthenticated(req, res, next) {
-    if (req.session.userId) {
-        return next(); // Pengguna terautentikasi
+// Middleware untuk memeriksa peran pengguna
+function isAdmin(req, res, next) {
+    if (req.session.user && req.session.user.role === 'admin') {
+        return next();
     } else {
-        return res.status(401).json({ message: 'Pengguna tidak terautentikasi.' }); // Pengguna tidak terautentikasi
+        return res.status(403).json({ message: 'Akses ditolak. Hanya untuk admin.' });
     }
 }
 
+// Fungsi untuk autentikasi pengguna
+async function authenticateUser(username, password) {
+    const query = 'SELECT * FROM users WHERE username = ?';
+    const [rows] = await db.query(query, [username]);
 
-// Rute untuk memproses pembayaran
-router.post('/payment', isAuthenticated, async (req, res) => {
-    try {
-        const cart = req.session.cart || []; // Pastikan cart terdefinisi
-        if (!cart.length) {
-            return res.status(400).json({ message: 'Keranjang belanja kosong.' });
-        }
-
-        // Hitung total jumlah
-        const grossAmount = cart.reduce((total, item) => total + (item.price * item.quantity), 0);
-        console.log('Total Amount:', grossAmount); // Log total jumlah untuk debugging
-
-        // Siapkan data transaksi untuk Midtrans
-        const transactionDetails = {
-            transaction_details: {
-                order_id: 'order-' + new Date().getTime(),
-                gross_amount: grossAmount,
-            },
-            credit_card: {
-                secure: true,
-            },
-        };
-
-        // Inisiasi transaksi Midtrans
-        const transaction = await snap.createTransaction(transactionDetails);
-        const tokenId = transaction.token;
-
-        // Kirim tokenId kembali ke klien
-        res.json({ tokenId });
-
-    } catch (error) {
-        console.error('Payment error:', error);
-        res.status(500).json({ message: 'Gagal memproses pembayaran.', error: error.message });
+    if (rows.length === 0) {
+        throw new Error('User not found');
     }
-});
+
+    const user = rows[0];
+    const isPasswordValid = await bcrypt.compare(password, user.password); // Membandingkan hash password
+
+    if (!isPasswordValid) {
+        throw new Error('Invalid password');
+    }
+
+    return user;
+}
 
 // Route Signup
 router.post('/signup', (req, res) => {
-    const { username, password, fullName, profilePicture, bio } = req.body; // Ambil data dari form
+    const { username, password, role = 'user' } = req.body;
 
     bcrypt.hash(password, 10, (err, hash) => {
         if (err) return res.status(500).send('Error hashing password');
 
         db.query(
-            'INSERT INTO users (username, password) VALUES (?, ?)',
-            [username, hash, fullName, profilePicture, bio], // Simpan data tambahan
+            'INSERT INTO users (username, password, role) VALUES (?, ?, ?)',
+            [username, hash, role],
             (err, result) => {
                 if (err) return res.status(500).send('Error registering user');
                 res.redirect('/login');
@@ -85,29 +66,31 @@ router.get('/signup', (req, res) => {
     });
 });
 
-// Route Login
-router.post('/login', (req, res) => {
+// Fungsi untuk mengambil produk dari database
+async function getProducts() {
+    const query = 'SELECT * FROM product'; // Sesuaikan dengan nama tabel produk Anda
+    const [rows] = await db.query(query);
+    return rows;
+}
+
+// Route untuk login
+router.post('/login', async (req, res) => {
     const { username, password } = req.body;
 
-    db.query('SELECT * FROM users WHERE username = ?', [username], (err, results) => {
-        if (err) return res.status(500).send('Error fetching user');
-        if (results.length === 0) return res.status(400).send('User not found');
+    try {
+        const user = await authenticateUser(username, password);
+        req.session.user = user;
 
-        bcrypt.compare(password, results[0].password, (err, isMatch) => {
-            if (err) return res.status(500).send('Error checking password');
-            if (!isMatch) return res.status(401).send('Incorrect password');
-
-            // Simpan userId dan informasi pengguna dalam sesi setelah login berhasil
-            req.session.userId = results[0].id;
-            req.session.user = { // Simpan data pengguna ke dalam sesi
-                username: results[0].username,
-                fullName: results[0].full_name,
-                profilePicture: results[0].profile_picture,
-                bio: results[0].bio
-            };
-            res.redirect('/'); // Arahkan ke halaman utama setelah login
-        });
-    });
+        // Arahkan pengguna berdasarkan perannya
+        if (user.role === 'admin') {
+            res.redirect('/dashboard'); // Arahkan admin ke halaman dashboard
+        } else {
+            res.redirect('/product'); // Arahkan pengguna biasa ke halaman produk
+        }
+    } catch (error) {
+        console.error(error);
+        res.status(401).send('Username atau password salah.'); // Memberikan pesan kesalahan
+    }
 });
 
 // Route untuk menampilkan form login
@@ -120,39 +103,65 @@ router.get('/login', (req, res) => {
 
 // Rute untuk logout
 router.get('/logout', (req, res) => {
-    // Menghapus data pengguna dari sesi
     req.session.destroy(err => {
         if (err) {
             return res.status(500).send('Could not log out.');
         }
-        // Redirect ke halaman utama setelah logout
-        res.redirect('/');
+        res.redirect('/'); // Redirect ke halaman utama setelah logout
     });
 });
 
 // Route untuk menampilkan halaman utama
 router.get('/', (req, res) => {
     const cart = req.session.cart || [];
-    const totalItems = cart.reduce((acc, item) => acc + item.quantity, 0); // Hitung total item
+    const totalItems = cart.reduce((acc, item) => acc + item.quantity, 0);
 
     res.render('index', {
         layout: 'layouts/main-layout',
         page: 'home',
-        totalItems, // Kirim total item ke tampilan
-        user: req.session.user // Kirim data pengguna ke tampilan
+        totalItems,
+        user: req.session.user,
     });
 });
 
-// Route untuk menampilkan profil pengguna
-router.get('/profile', (req, res) => {
-    if (!req.session.userId) {
-        return res.redirect('/login'); // Arahkan ke halaman login jika tidak terautentikasi
+// Rute dashboard yang memerlukan otentikasi admin
+router.get('/dashboard', isAuthenticated, isAdmin, async (req, res) => {
+    try {
+        const products = await getProducts(); // Ambil produk dari database
+        res.render('dashboard', {
+            layout: 'layouts/main-layout',
+            user: req.session.user, // Mengambil informasi pengguna dari session
+            products, // Kirim produk ke template
+            page: 'dashboard'
+        });
+    } catch (error) {
+        console.error(error);
+        res.status(500).send('Error fetching products.');
     }
+});
 
+// Route untuk menampilkan profil pengguna
+router.get('/profile', isAuthenticated, (req, res) => {
     res.render('profile', {
         layout: 'layouts/main-layout',
-        user: req.session.user // Kirim data pengguna ke tampilan
+        user: req.session.user
     });
+});
+
+// Rute untuk menampilkan halaman produk
+router.get('/product', isAuthenticated, async (req, res) => {
+    try {
+        const products = await getProducts(); // Ambil produk dari database
+        res.render('product', {
+            layout: 'layouts/main-layout',
+            products,
+            user: req.session.user,
+            page: 'products'
+        });
+    } catch (error) {
+        console.error(error);
+        res.status(500).send('Error fetching products.');
+    }
 });
 
 module.exports = router;
